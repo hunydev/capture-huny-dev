@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>capture.huny.dev — 렌더링 캡처 데모</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --fg: #e5e7eb;
+      --muted: #9aa3b2;
+      --accent: #4f7cff;
+      --card: #111827;
+      --frame: #0f172a;
+      --border: #1f2937;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      background: radial-gradient(1000px 600px at 10% -10%, #10192b 0%, var(--bg) 60%);
+      color: var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    header { margin-bottom: 24px; }
+    header h1 { margin: 0 0 8px; font-size: 24px; }
+    header p { margin: 0; color: var(--muted); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+    .frame {
+      width: 100%;
+      aspect-ratio: 1200 / 630; /* OG 기본 비율 */
+      background: linear-gradient(135deg, var(--frame), #0b1226);
+      border: 2px dashed #243045;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      position: relative;
+      margin-bottom: 14px;
+    }
+    .frame img {
+      max-width: 100%;
+      max-height: 100%;
+      display: block;
+      object-fit: contain;
+    }
+    .hint {
+      position: absolute; inset: 0;
+      display: grid; place-items: center;
+      color: #8aa2d5; pointer-events: none;
+      font-size: 14px; text-align: center; padding: 8px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .controls input[type="url"] {
+      width: 100%; padding: 12px 14px; border-radius: 10px;
+      border: 1px solid var(--border); background: #0c1326; color: var(--fg);
+      outline: none;
+    }
+    .controls button {
+      padding: 12px 18px; border-radius: 10px; border: 1px solid #2a3b68;
+      background: linear-gradient(180deg, #2c4cff, #2342e6);
+      color: white; font-weight: 600; cursor: pointer;
+    }
+    .controls button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .row {
+      display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;
+      color: var(--muted); font-size: 13px;
+    }
+    .row .chip { padding: 6px 10px; border: 1px solid var(--border); border-radius: 999px; }
+    .progress {
+      height: 8px; width: 100%;
+      background: #0a1124; border: 1px solid var(--border);
+      border-radius: 999px; overflow: hidden; margin-top: 12px;
+    }
+    .bar {
+      height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent), #7aa2ff);
+      transition: width 120ms ease-out;
+    }
+    .msg { margin-top: 8px; font-size: 13px; color: var(--muted); }
+    .msg.ok { color: var(--ok); }
+    .msg.warn { color: var(--warn); }
+    .msg.err { color: var(--err); }
+    footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
+    a { color: #9db5ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>capture.huny.dev</h1>
+      <p>Cloudflare Workers + Browser Rendering(Puppeteer)로 <b>렌더링 후 캡처</b>한 썸네일을 반환합니다.  
+         <code>?url=</code> 파라미터가 있을 때만 이미지가 응답되고, 그 외에는 이 페이지가 표시됩니다.</p>
+    </header>
+
+    <section class="card">
+      <div class="frame" id="frame">
+        <img id="shot" alt="캡처 결과 미리보기" hidden />
+        <div id="hint" class="hint">
+          <div>
+            <div style="font-size:16px; margin-bottom:6px;">썸네일 프레임</div>
+            <div>아래에 <code>https://*.huny.dev</code> URL을 넣고 <b>캡처</b>를 눌러보세요.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <input id="inputUrl" type="url" placeholder="https://apps.huny.dev 또는 https://docs.huny.dev ..." />
+        <button id="btn">캡처</button>
+      </div>
+
+      <div class="row">
+        <div class="chip">허용 도메인: <code>huny.dev</code> / <code>*.huny.dev</code></div>
+        <div class="chip">기본 사이즈: 1200×630</div>
+        <div class="chip">응답: PNG</div>
+      </div>
+
+      <div class="progress" aria-hidden="true">
+        <div class="bar" id="bar"></div>
+      </div>
+      <div class="msg" id="msg">준비되었습니다.</div>
+    </section>
+
+    <footer>
+      사용 예시: <code>https://capture.huny.dev/screenshot?url=https://apps.huny.dev</code> |
+      선택 옵션은 워커 코드에서 확장 (예: <code>w</code>, <code>h</code>, <code>dpr</code>, <code>format</code>, <code>selector</code> …)
+    </footer>
+  </div>
+
+  <script>
+    const input = document.getElementById('inputUrl');
+    const btn = document.getElementById('btn');
+    const shot = document.getElementById('shot');
+    const hint = document.getElementById('hint');
+    const bar  = document.getElementById('bar');
+    const msg  = document.getElementById('msg');
+
+    function setProgress(pct) {
+      bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    }
+    function setMsg(text, cls = '') {
+      msg.className = 'msg' + (cls ? ' ' + cls : '');
+      msg.textContent = text;
+    }
+    function isAllowed(u) {
+      try {
+        let s = u.trim();
+        if (!/^https?:\/\//i.test(s)) s = 'https://' + s; // 기본 https
+        const { hostname, protocol } = new URL(s);
+        if (protocol !== 'https:' && protocol !== 'http:') return false;
+        const h = hostname.toLowerCase();
+        return h === 'huny.dev' || h.endsWith('.huny.dev');
+      } catch { return false; }
+    }
+
+    async function capture() {
+      const u = input.value.trim();
+      if (!u) {
+        setMsg('URL을 입력하세요.', 'warn');
+        return;
+      }
+      if (!isAllowed(u)) {
+        setMsg('허용되지 않은 도메인입니다. huny.dev 또는 서브도메인만 가능.', 'err');
+        return;
+      }
+
+      // 진행바 초기화
+      setProgress(0);
+      setMsg('렌더링 및 캡처 중…');
+      btn.disabled = true;
+
+      // 같은 오리진이므로 fetch로 blob을 받아 진행률 갱신 → objectURL로 img 표시
+      const endpoint = `/screenshot?url=${encodeURIComponent(u)}`;
+      try {
+        const res = await fetch(endpoint);
+        if (!res.ok || !res.body) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const reader = res.body.getReader();
+        const contentLength = Number(res.headers.get('Content-Length')) || 0;
+        let received = 0;
+        const chunks = [];
+
+        // 스트리밍 진행률 표시
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          if (contentLength) {
+            setProgress((received / contentLength) * 100);
+          } else {
+            // content-length가 없으면 의사 진행률
+            setProgress(Math.min(95, (received / (1024 * 1024)) * 20)); // 대략적
+          }
+        }
+
+        const blob = new Blob(chunks, { type: res.headers.get('content-type') || 'image/png' });
+        const url = URL.createObjectURL(blob);
+
+        shot.src = url;
+        shot.hidden = false;
+        hint.hidden = true;
+        setProgress(100);
+        setMsg('완료', 'ok');
+      } catch (e) {
+        console.error(e);
+        setMsg('캡처 실패: ' + (e?.message || e), 'err');
+        setProgress(0);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    btn.addEventListener('click', capture);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') capture();
+    });
+
+    // 데모 기본값
+    input.value = 'https://apps.huny.dev';
+  </script>
+</body>
+</html>
