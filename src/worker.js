@@ -65,6 +65,11 @@ function extractImageIdFromVariantUrl(u) {
   }
 }
 
+// KV 키 프리픽스: 풀 URL 저장 키
+const URL_KEY_PREFIX = "url|";
+const CRON_CURSOR_KEY = "cron|cursor:url";
+const CRON_BATCH_SIZE = 10; // 한 번의 cron 실행에서 처리할 최대 URL 수(순차 처리)
+
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
@@ -241,5 +246,68 @@ export default {
     const h = new Headers(assetRes.headers);
     h.set("x-capture-landing", "1");
     return new Response(assetRes.body, { status: assetRes.status, statusText: assetRes.statusText, headers: h });
+  },
+
+  // Cron 트리거에서 호출: 저장된 URL 키들을 순회하며 강제 재캡처 수행
+  async scheduled(controller, env, ctx) {
+    if (!env.CAPTURE_KV) return;
+    try {
+      const cursor = await env.CAPTURE_KV.get(CRON_CURSOR_KEY, { type: "text" });
+      const listOpts = { prefix: URL_KEY_PREFIX, limit: CRON_BATCH_SIZE };
+      if (cursor) listOpts.cursor = cursor;
+      const ls = await env.CAPTURE_KV.list(listOpts);
+
+      if (ls && Array.isArray(ls.keys) && ls.keys.length > 0) {
+        const browser = await puppeteer.launch(env.MYBROWSER);
+        try {
+          for (const k of ls.keys) {
+            const name = k?.name;
+            if (typeof name !== "string" || !name.startsWith(URL_KEY_PREFIX)) continue;
+            const normalized = name.slice(URL_KEY_PREFIX.length);
+            if (!isAllowedUrl(normalized)) continue; // 안전 도메인만 처리
+            try {
+              const page = await browser.newPage();
+              await page.setViewport({ width: 1200, height: 630, deviceScaleFactor: 2 });
+              await page.goto(normalized, { waitUntil: "networkidle0", timeout: 20000 });
+              const buf = await page.screenshot({ type: "png" });
+              await page.close();
+
+              // 업로드 후 ID 저장
+              if (env.IMAGES_ACCOUNT_ID && env.API_TOKEN) {
+                const fd = new FormData();
+                fd.append("file", new Blob([buf], { type: "image/png" }), "screenshot.png");
+                fd.append("requireSignedURLs", "false");
+                const api = `https://api.cloudflare.com/client/v4/accounts/${env.IMAGES_ACCOUNT_ID}/images/v1`;
+                const upRes = await fetch(api, { method: "POST", headers: { Authorization: `Bearer ${env.API_TOKEN}` }, body: fd });
+                const upJson = await upRes.json();
+                if (upRes.ok && upJson?.success && upJson?.result?.id) {
+                  const imageId = upJson.result.id;
+                  const body = JSON.stringify({ id: imageId });
+                  const puts = [];
+                  const urlKey2 = urlKeyFromNormalized(normalized);
+                  const hostKey2 = keyFromNormalized(normalized);
+                  if (urlKey2) puts.push(env.CAPTURE_KV.put(urlKey2, body));
+                  if (hostKey2) puts.push(env.CAPTURE_KV.put(hostKey2, body));
+                  await Promise.allSettled(puts);
+                }
+              }
+            } catch {
+              // 개별 URL 실패는 무시하고 다음 항목 진행
+            }
+          }
+        } finally {
+          await browser.close();
+        }
+      }
+
+      // 커서 저장/초기화
+      if (ls?.list_complete) {
+        ctx?.waitUntil(env.CAPTURE_KV.delete(CRON_CURSOR_KEY));
+      } else if (ls?.cursor) {
+        ctx?.waitUntil(env.CAPTURE_KV.put(CRON_CURSOR_KEY, ls.cursor));
+      }
+    } catch {
+      // 리스트/커서 오류는 무시
+    }
   }
 };
