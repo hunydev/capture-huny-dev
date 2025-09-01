@@ -97,6 +97,8 @@
     footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
     a { color: #9db5ff; text-decoration: none; }
     a:hover { text-decoration: underline; }
+    /* ensure hidden attribute always hides elements despite our display rules */
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
@@ -182,6 +184,10 @@
       setProgress(0);
       setMsg('렌더링 및 캡처 중…');
       btn.disabled = true;
+      // 진행 시작 상태: 힌트 보이기, 이미지 감추기
+      hint.hidden = false;
+      shot.hidden = true;
+      shot.removeAttribute('src');
 
       // 같은 오리진이므로 fetch로 blob을 받아 진행률 갱신 → objectURL로 img 표시
       const endpoint = `/screenshot?url=${encodeURIComponent(u)}`;
@@ -222,6 +228,9 @@
         console.error(e);
         setMsg('캡처 실패: ' + (e?.message || e), 'err');
         setProgress(0);
+        // 실패 시 힌트 다시 보이기, 이미지 감추기
+        hint.hidden = false;
+        shot.hidden = true;
       } finally {
         btn.disabled = false;
       }
