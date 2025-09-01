@@ -13,5 +13,13 @@
 	"observability": { "enabled": true },
   
 	"assets": { "directory": "public", "binding": "ASSETS" },
-	"browser": { "binding": "MYBROWSER" }
+	"browser": { "binding": "MYBROWSER" },
+
+	"kv_namespaces": [
+		{ "binding": "CAPTURE_KV", "id": "de4a6e2e7cb44d4ab66f44d3b687e097", "preview_id": "de4a6e2e7cb44d4ab66f44d3b687e097" }
+	],
+
+	"vars": {
+		"IMAGES_ACCOUNT_ID": "43726b4d8c851eae1ab87a8d5a67dd06"
+	}
   }

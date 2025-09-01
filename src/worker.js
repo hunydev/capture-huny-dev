@@ -28,8 +28,16 @@ function normalizeTarget(u) {
   }
 }
 
+function keyFromNormalized(normalizedUrl) {
+  try {
+    return new URL(normalizedUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const url = new URL(req.url);
     const pathname = url.pathname || "/";
     const target = url.searchParams.get("url");
@@ -48,6 +56,28 @@ export default {
         });
       }
 
+      // 1) KV 캐시 조회: 키는 호스트명 (예: apps.huny.dev)
+      const kvKey = keyFromNormalized(normalized);
+      if (kvKey && env.CAPTURE_KV) {
+        try {
+          const cached = await env.CAPTURE_KV.get(kvKey, { type: "text" });
+          if (cached) {
+            let rec;
+            try { rec = JSON.parse(cached); } catch { rec = { url: cached }; }
+            const variantUrl = rec?.url;
+            if (variantUrl) {
+              const imgRes = await fetch(variantUrl);
+              const h = new Headers(imgRes.headers);
+              h.set("x-capture-worker", "1");
+              h.set("x-capture-cache", "hit");
+              return new Response(imgRes.body, { status: imgRes.status, statusText: imgRes.statusText, headers: h });
+            }
+          }
+        } catch (e) {
+          // KV 오류 시 캐시 무시하고 렌더링 이어감
+        }
+      }
+
       const browser = await puppeteer.launch(env.MYBROWSER);
       try {
         const page = await browser.newPage();
@@ -55,11 +85,39 @@ export default {
         await page.goto(normalized, { waitUntil: "networkidle0", timeout: 20000 });
 
         const buf = await page.screenshot({ type: "png" });
+
+        // 2) 업로드 → Images → KV 저장 (베스트-effort, 실패해도 응답은 진행)
+        ctx?.waitUntil((async () => {
+          try {
+            if (!env.IMAGES_ACCOUNT_ID || !env.API_TOKEN) return;
+            const fd = new FormData();
+            fd.append("file", new Blob([buf], { type: "image/png" }), "screenshot.png");
+            const api = `https://api.cloudflare.com/client/v4/accounts/${env.IMAGES_ACCOUNT_ID}/images/v1`;
+            const upRes = await fetch(api, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${env.API_TOKEN}` },
+              body: fd
+            });
+            const upJson = await upRes.json();
+            if (upRes.ok && upJson?.success && upJson?.result) {
+              const imageId = upJson.result.id;
+              const variants = upJson.result.variants || [];
+              const variantUrl = Array.isArray(variants) && variants.length ? variants[0] : null;
+              if (kvKey && variantUrl && env.CAPTURE_KV) {
+                await env.CAPTURE_KV.put(kvKey, JSON.stringify({ id: imageId, url: variantUrl }));
+              }
+            }
+          } catch (e) {
+            // 업로드 실패는 무시 (로그만 가능하면 좋지만 워커 콘솔에 의존)
+          }
+        })());
+
         return new Response(buf, {
           headers: {
             "content-type": "image/png",
             "cache-control": "no-store, no-cache, must-revalidate",
-            "x-capture-worker": "1"
+            "x-capture-worker": "1",
+            "x-capture-cache": "miss"
           }
         });
       } finally {
