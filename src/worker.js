@@ -1,11 +1,10 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-function isAllowedUrl(u) {
+// 캡처(렌더링) 허용 도메인: huny.dev 전용
+function isCaptureAllowedUrl(u) {
   try {
-    // 스킴이 없으면 https로 간주
-    if (!/^https?:\/\//i.test(u)) {
-      u = "https://" + u;
-    }
+    // 스킴 보정
+    if (!/^https?:\/\//i.test(u)) u = "https://" + u;
     const { hostname, protocol } = new URL(u);
     if (protocol !== "https:" && protocol !== "http:") return false;
     return hostname === "huny.dev" || hostname.endsWith(".huny.dev");
@@ -18,10 +17,9 @@ function normalizeTarget(u) {
   try {
     let s = (u || "").trim();
     if (!s) return null;
-    if (!/^https?:\/\//i.test(s)) {
-      s = "https://" + s; // 기본 https
-    }
-    if (!isAllowedUrl(s)) return null;
+    if (!/^https?:\/\//i.test(s)) s = "https://" + s; // 기본 https
+    const { protocol } = new URL(s);
+    if (protocol !== "https:" && protocol !== "http:") return null;
     return new URL(s).toString();
   } catch {
     return null;
@@ -95,6 +93,8 @@ const GOTO_TIMEOUT_MS = 20000;     // 페이지 진입 타임아웃(dcl)
 const IDLE_TIMEOUT_MS = 3000;      // 네트워크 유휴 대기 최대시간
 const IDLE_IDLE_TIME_MS = 800;     // 유휴판정 시간
 const OVERALL_DEADLINE_MS = 25000; // 전체 캡처 마감시간
+const OG_HTML_TIMEOUT_MS = 4000;   // OG HTML 파싱 타임아웃
+const OG_IMAGE_TIMEOUT_MS = 7000;  // OG 이미지 다운로드 타임아웃
 
 function msLeft(deadlineAt) { return Math.max(0, deadlineAt - Date.now()); }
 function sleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
@@ -203,6 +203,174 @@ async function setupPageForCapture(page) {
   } catch {}
 }
 
+function parseSocialImageFromHtml(html, baseUrl) {
+  try {
+    const metas = html.match(/<meta\s+[^>]*>/gi) || [];
+    const links = html.match(/<link\s+[^>]*>/gi) || [];
+
+    const getAttr = (tag, attr) => {
+      const m = new RegExp(`\\b${attr}\\s*=\\s*['\"]([^'\"]+)['\"]`, "i").exec(tag);
+      return m ? m[1] : null;
+    };
+    const norm = v => (v || "").trim().toLowerCase();
+    const toAbs = (u) => {
+      try { return new URL(u, baseUrl).toString(); } catch { return null; }
+    };
+    const extScore = (u) => {
+      try {
+        const { pathname } = new URL(u);
+        const m = /\.([a-z0-9]+)(?:$|[?#])/i.exec(pathname);
+        const ext = (m?.[1] || "").toLowerCase();
+        if (ext === "svg") return -6;
+        if (ext === "gif") return -2;
+        if (ext === "jpg" || ext === "jpeg" || ext === "png" || ext === "webp") return 4;
+        return 0;
+      } catch { return 0; }
+    };
+    const areaScore = (w, h) => {
+      const W = Number(w), H = Number(h);
+      if (!Number.isFinite(W) || !Number.isFinite(H) || W <= 0 || H <= 0) return 0;
+      const base = 600 * 315; // 일반 OG 기준치
+      const area = W * H;
+      if (area <= base) return 1;
+      const ratio = area / base;
+      return Math.min(20, Math.floor(Math.log2(ratio) * 5));
+    };
+
+    const candMap = new Map(); // url -> { url, source, weight, w, h }
+    const ensure = (url, source, baseWeight = 0) => {
+      if (!url) return null;
+      const abs = toAbs(url);
+      if (!abs || !/^https?:\/\//i.test(abs)) return null;
+      const isHttps = /^https:/i.test(abs);
+      const cur = candMap.get(abs) || { url: abs, source, weight: 0, w: 0, h: 0 };
+      if (!cur.source) cur.source = source;
+      cur.weight += baseWeight + (isHttps ? 1 : 0) + extScore(abs);
+      candMap.set(abs, cur);
+      return cur;
+    };
+
+    const OG_URL_KEYS = new Set(["og:image", "og:image:url", "og:image:secure_url"]);
+    const TW_URL_KEYS = new Set(["twitter:image", "twitter:image:src", "twitter:image:url", "twitter:image:secure_url"]);
+    const ITEM_KEYS = new Set(["image", "thumbnailurl", "thumbnail"]);
+
+    let ctxOg = null; // { url }
+    let ctxTw = null;
+
+    // meta tags
+    for (const tag of metas) {
+      const prop = norm(getAttr(tag, "property"));
+      const name = norm(getAttr(tag, "name"));
+      const itemprop = norm(getAttr(tag, "itemprop"));
+      const key = prop || name || itemprop;
+      const content = getAttr(tag, "content");
+      if (!key) continue;
+
+      if (OG_URL_KEYS.has(key)) {
+        const c = ensure(content, "og", 100 + (key.includes("secure") ? 2 : 0));
+        if (c) ctxOg = c;
+        continue;
+      }
+      if (key === "og:image:width" && ctxOg) { const v = parseInt(content || "", 10); if (Number.isFinite(v)) ctxOg.w = v; continue; }
+      if (key === "og:image:height" && ctxOg) { const v = parseInt(content || "", 10); if (Number.isFinite(v)) ctxOg.h = v; continue; }
+      if (key === "og:image:type" && ctxOg) { if ((content||"").toLowerCase().includes("svg")) ctxOg.weight -= 6; continue; }
+
+      if (TW_URL_KEYS.has(key)) {
+        const c = ensure(content, "twitter", 90 + (key.includes("secure") ? 2 : 0));
+        if (c) ctxTw = c;
+        continue;
+      }
+      if (key === "twitter:card" && ctxTw) { if (norm(content).includes("summary_large_image")) ctxTw.weight += 6; continue; }
+
+      if (ITEM_KEYS.has(key)) { ensure(content, itemprop ? "itemprop" : "name", 70); continue; }
+    }
+
+    // link rel=image_src
+    for (const tag of links) {
+      const rel = norm(getAttr(tag, "rel"));
+      const href = getAttr(tag, "href");
+      if (rel && rel.includes("image_src")) ensure(href, "link", 80);
+    }
+
+    // 가중치에 크기 반영
+    for (const c of candMap.values()) {
+      c.weight += areaScore(c.w, c.h);
+    }
+
+    if (candMap.size === 0) return null;
+    const arr = Array.from(candMap.values());
+    arr.sort((a, b) => {
+      if (b.weight !== a.weight) return b.weight - a.weight;
+      const areaA = (a.w||0) * (a.h||0);
+      const areaB = (b.w||0) * (b.h||0);
+      if (areaB !== areaA) return areaB - areaA;
+      return 0;
+    });
+    const best = arr[0];
+    return best ? { url: best.url, source: best.source, width: best.w || 0, height: best.h || 0 } : null;
+  } catch {}
+  return null;
+}
+
+async function tryFetchSocialImageResponse(normalized, env, deadlineAt) {
+  // 1) HTML 가져와 og:image 발견 시도
+  const htmlBudget = Math.max(1000, Math.min(OG_HTML_TIMEOUT_MS, msLeft(deadlineAt)));
+  let htmlRes;
+  try {
+    htmlRes = await fetchWithTimeout(normalized, {
+      method: "GET",
+      headers: {
+        "accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "user-agent": DEFAULT_UA
+      },
+      redirect: "follow",
+      cf: { cacheTtl: 0, cacheEverything: false }
+    }, htmlBudget);
+  } catch {
+    return null; // HTML을 못 가져오면 og 시도는 종료(도메인별 후속 정책에서 처리)
+  }
+  const ct = (htmlRes.headers.get("content-type") || "").toLowerCase();
+  if (!(ct.includes("text/html") || ct.includes("application/xhtml+xml"))) {
+    // HTML이 아니면 og 파싱 스킵
+    return null;
+  }
+  let html;
+  try {
+    html = await htmlRes.text();
+  } catch {
+    return null;
+  }
+  const found = parseSocialImageFromHtml(html, normalized);
+  if (!found) return null;
+
+  // 2) og:image를 프록시해서 반환
+  const imgBudget = Math.max(1000, Math.min(OG_IMAGE_TIMEOUT_MS, msLeft(deadlineAt)));
+  let imgRes;
+  try {
+    imgRes = await fetchWithTimeout(found.url, {
+      headers: { "accept": "image/avif,image/webp,image/*,*/*;q=0.1" },
+      redirect: "follow",
+      cf: { cacheTtl: 0, cacheEverything: false }
+    }, imgBudget);
+  } catch {
+    return null;
+  }
+  const ct2 = (imgRes.headers.get("content-type") || "").toLowerCase();
+  if (!imgRes.ok || !ct2.startsWith("image/")) return null;
+
+  const h = new Headers();
+  h.set("content-type", ct2 || "image/png");
+  h.set("cache-control", "no-store, no-cache, must-revalidate");
+  h.set("x-capture-worker", "1");
+  h.set("x-capture-source", "meta");
+  h.set("x-capture-cache", "meta");
+  if (found?.source) h.set("x-capture-meta", String(found.source));
+  if (found?.width && found?.height) h.set("x-capture-meta-size", `${found.width}x${found.height}`);
+  try { h.set("x-social-origin", new URL(found.url).origin); } catch {}
+  return new Response(imgRes.body, { status: 200, headers: h });
+}
+
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
@@ -211,6 +379,8 @@ export default {
     const hasTarget = typeof target === "string" && target.trim().length > 0;
     const forceParam = url.searchParams.get("force");
     const force = typeof forceParam === "string" && /^(1|true|yes)$/i.test(forceParam);
+    const previewParam = url.searchParams.get("preview");
+    const preview = typeof previewParam === "string" && /^(1|true|yes)$/i.test(previewParam);
 
     // /screenshot 경로 또는 쿼리에 url이 있으면 캡처 API 시도
     if (pathname.startsWith("/screenshot") || pathname.startsWith("/api/screenshot") || hasTarget) {
@@ -219,10 +389,80 @@ export default {
       }
       const normalized = normalizeTarget(target);
       if (!normalized) {
-        return jsonError(403, "domain-not-allowed", "Only huny.dev domain is allowed.", { "x-capture-cache": "miss" });
+        return jsonError(400, "invalid-url", "Invalid URL or unsupported protocol (use http/https).", { "x-capture-cache": "miss" });
       }
 
-      // 1) KV 캐시 조회: 우선 순위 (풀 URL 키) → (레거시 호스트 키)
+      // 전체 예산 시작
+      const deadlineAt = Date.now() + OVERALL_DEADLINE_MS;
+
+      // preview 모드: huny.dev 전용 강제 렌더링 (메타/캐시 우회, 업로드/캐시 저장 안 함)
+      if (preview) {
+        const isHunyPrev = isCaptureAllowedUrl(normalized);
+        if (!isHunyPrev) {
+          return jsonError(403, "preview-not-allowed", "Preview rendering is allowed only for huny.dev.", {
+            "x-capture-cache": "preview-deny"
+          });
+        }
+
+        const pfPrev = await preflightCheck(normalized, env, Math.min(PREFLIGHT_TIMEOUT_MS, msLeft(deadlineAt)));
+        if (!pfPrev.ok) {
+          return jsonError(pfPrev.status || 504, pfPrev.code || "preflight", pfPrev.message || "Preflight failed", {
+            "x-capture-cache": "preview-preflight"
+          });
+        }
+
+        let browser;
+        try {
+          browser = await puppeteer.launch(env.MYBROWSER);
+          try {
+            const page = await browser.newPage();
+            await setupPageForCapture(page);
+            await page.setViewport({ width: 1200, height: 630, deviceScaleFactor: 2 });
+            const gotoTimeout = Math.max(1000, Math.min(GOTO_TIMEOUT_MS, msLeft(deadlineAt)));
+            try {
+              await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: gotoTimeout });
+            } catch {}
+            const settleWait = Math.min(IDLE_IDLE_TIME_MS, Math.max(0, Math.min(IDLE_TIMEOUT_MS, msLeft(deadlineAt))));
+            if (settleWait > 0) await sleep(settleWait);
+            const buf = await page.screenshot({ type: "png" });
+            return new Response(buf, {
+              headers: {
+                "content-type": "image/png",
+                "cache-control": "no-store, no-cache, must-revalidate",
+                "x-capture-worker": "1",
+                "x-capture-source": "preview",
+                "x-capture-cache": "preview",
+                "x-preview": "1"
+              }
+            });
+          } finally {
+            await browser.close();
+          }
+        } catch (e) {
+          const name = (e && (e.name || e.code || e.type)) ? String(e.name || e.code || e.type) : "";
+          const msg = e && e.message ? String(e.message) : "Preview capture failed";
+          const isTimeout = name === "TimeoutError" || /\btimeout\b|\btimed out\b/i.test(msg);
+          return jsonError(isTimeout ? 504 : 500, isTimeout ? "preview-timeout" : "preview-failed", msg, {
+            "x-capture-cache": "preview-fail"
+          });
+        }
+      }
+
+      // 0) 소셜 메타(OG/Twitter/link) 이미지 우선 시도 (도메인 무관, 성공 시 바로 반환)
+      try {
+        const socialRes = await tryFetchSocialImageResponse(normalized, env, deadlineAt);
+        if (socialRes) return socialRes;
+      } catch {}
+
+      // 0-1) huny.dev가 아니고 소셜 메타 이미지도 없으면 에러 반환
+      const isHuny = isCaptureAllowedUrl(normalized);
+      if (!isHuny) {
+        return jsonError(404, "social-not-found", "No social meta image (OG/Twitter/link) found; rendering capture is allowed only for huny.dev.", {
+          "x-capture-cache": "meta-miss"
+        });
+      }
+
+      // 1) (huny.dev 전용) KV 캐시 조회: 우선 순위 (풀 URL 키) → (레거시 호스트 키)
       const urlKey = urlKeyFromNormalized(normalized);
       const hostKey = keyFromNormalized(normalized);
       // force인 경우 기존 캐시를 삭제하고 조회를 우회
@@ -318,8 +558,7 @@ export default {
         }
       }
 
-      // 프리플라이트로 방화벽/차단/연결 불가를 빠르게 식별
-      const deadlineAt = Date.now() + OVERALL_DEADLINE_MS;
+      // 프리플라이트로 방화벽/차단/연결 불가를 빠르게 식별 (huny.dev 캡처 전용)
       const pf = await preflightCheck(normalized, env, Math.min(PREFLIGHT_TIMEOUT_MS, msLeft(deadlineAt)));
       if (!pf.ok) {
         return jsonError(pf.status || 504, pf.code || "preflight", pf.message || "Preflight failed", {
@@ -419,7 +658,7 @@ export default {
             const name = k?.name;
             if (typeof name !== "string" || !name.startsWith(URL_KEY_PREFIX)) continue;
             const normalized = name.slice(URL_KEY_PREFIX.length);
-            if (!isAllowedUrl(normalized)) continue; // 안전 도메인만 처리
+            if (!isCaptureAllowedUrl(normalized)) continue; // 안전 도메인만 처리
             try {
               // 프리플라이트로 빠른 차단
               const sDeadlineAt = Date.now() + OVERALL_DEADLINE_MS;

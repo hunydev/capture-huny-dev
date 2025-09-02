@@ -119,7 +119,7 @@
         <div id="hint" class="hint">
           <div>
             <div style="font-size:16px; margin-bottom:6px;">썸네일 프레임</div>
-            <div>아래에 <code>https://*.huny.dev</code> URL을 넣고 <b>캡처</b>를 눌러보세요.</div>
+            <div>아래에 <code>http(s)://…</code> URL을 넣고 <b>캡처</b>를 눌러보세요.<br/>페이지에 소셜 메타(OG/Twitter 등)가 있으면 그대로 반환, 없으면 <code>huny.dev</code> 도메인만 렌더링 캡처합니다.</div>
           </div>
         </div>
       </div>
@@ -131,9 +131,9 @@
       </div>
 
       <div class="row">
-        <div class="chip">허용 도메인: <code>huny.dev</code> / <code>*.huny.dev</code></div>
-        <div class="chip">기본 사이즈: 1200×630</div>
-        <div class="chip">응답: PNG</div>
+        <div class="chip">정책: 소셜 메타 이미지 우선 반환, 없으면 huny.dev만 렌더링</div>
+        <div class="chip">기본 사이즈(렌더링): 1200×630</div>
+        <div class="chip">응답: 이미지(소셜 메타 원본 또는 PNG)</div>
       </div>
 
       <div class="progress" aria-hidden="true">
@@ -143,8 +143,21 @@
     </section>
 
     <footer>
-      사용 예시: <code>https://capture.huny.dev/screenshot?url=https://apps.huny.dev</code> |
-      선택 옵션은 워커 코드에서 확장 (예: <code>w</code>, <code>h</code>, <code>dpr</code>, <code>format</code>, <code>selector</code> …)
+      <div class="usage">
+        사용 예시: <code>https://capture.huny.dev/screenshot?url=https://apps.huny.dev</code> |
+        선택 옵션은 워커 코드에서 확장 (예: <code>w</code>, <code>h</code>, <code>dpr</code>, <code>format</code>, <code>selector</code> …)
+      </div>
+      <div class="credits">
+        This web app is made by <a href="https://huny.dev" target="_blank" rel="noopener">HunyDev</a>. &copy; 2025 HunyDev
+      </div>
+      <div class="links">
+        <a href="https://huny.dev" target="_blank" rel="noopener">Website</a> &middot;
+        <a href="https://blog.huny.dev" target="_blank" rel="noopener">Blog</a> &middot;
+        <a href="https://apps.huny.dev" target="_blank" rel="noopener">Apps</a> &middot;
+        <a href="https://docs.huny.dev" target="_blank" rel="noopener">Docs</a> &middot;
+        <a href="https://github.com/hunydev" target="_blank" rel="noopener">GitHub</a> &middot;
+        <a href="https://discord.gg/Tb28dpa3" target="_blank" rel="noopener">Discord</a>
+      </div>
     </footer>
   </div>
 
@@ -164,14 +177,12 @@
       msg.className = 'msg' + (cls ? ' ' + cls : '');
       msg.textContent = text;
     }
-    function isAllowed(u) {
+    function isValidHttpUrl(u) {
       try {
         let s = u.trim();
         if (!/^https?:\/\//i.test(s)) s = 'https://' + s; // 기본 https
-        const { hostname, protocol } = new URL(s);
-        if (protocol !== 'https:' && protocol !== 'http:') return false;
-        const h = hostname.toLowerCase();
-        return h === 'huny.dev' || h.endsWith('.huny.dev');
+        const { protocol } = new URL(s);
+        return protocol === 'https:' || protocol === 'http:';
       } catch { return false; }
     }
 
@@ -181,8 +192,8 @@
         setMsg('URL을 입력하세요.', 'warn');
         return;
       }
-      if (!isAllowed(u)) {
-        setMsg('허용되지 않은 도메인입니다. huny.dev 또는 서브도메인만 가능.', 'err');
+      if (!isValidHttpUrl(u)) {
+        setMsg('유효하지 않은 URL입니다. http/https를 사용하세요.', 'err');
         return;
       }
 
