@@ -60,7 +60,7 @@
     }
     .controls {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: 1fr auto auto;
       gap: 10px;
       align-items: center;
     }
@@ -75,6 +75,11 @@
       color: white; font-weight: 600; cursor: pointer;
     }
     .controls button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .controls label.force {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px;
+      background: #0c1326; color: var(--muted); font-size: 13px; user-select: none; cursor: pointer;
+    }
     .row {
       display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;
       color: var(--muted); font-size: 13px;
@@ -105,8 +110,7 @@
   <div class="wrap">
     <header>
       <h1>capture.huny.dev</h1>
-      <p>Cloudflare Workers + Browser Rendering(Puppeteer)로 <b>렌더링 후 캡처</b>한 썸네일을 반환합니다.  
-         <code>?url=</code> 파라미터가 있을 때만 이미지가 응답되고, 그 외에는 이 페이지가 표시됩니다.</p>
+      <p>Cloudflare Workers + Browser Rendering(Puppeteer)로 <b>렌더링 후 캡처</b>한 썸네일을 반환합니다.</p>
     </header>
 
     <section class="card">
@@ -123,6 +127,7 @@
       <div class="controls">
         <input id="inputUrl" type="url" placeholder="https://apps.huny.dev 또는 https://docs.huny.dev ..." />
         <button id="btn">캡처</button>
+        <label class="force" title="강제 리프레시 (캐시 무시 후 재생성)"><input type="checkbox" id="force" /> force</label>
       </div>
 
       <div class="row">
@@ -150,6 +155,7 @@
     const hint = document.getElementById('hint');
     const bar  = document.getElementById('bar');
     const msg  = document.getElementById('msg');
+    const forceChk = document.getElementById('force');
 
     function setProgress(pct) {
       bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
@@ -190,11 +196,28 @@
       shot.removeAttribute('src');
 
       // 같은 오리진이므로 fetch로 blob을 받아 진행률 갱신 → objectURL로 img 표시
-      const endpoint = `/screenshot?url=${encodeURIComponent(u)}`;
+      let endpoint = `/screenshot?url=${encodeURIComponent(u)}`;
+      if (forceChk && forceChk.checked) endpoint += `&force=1`;
       try {
         const res = await fetch(endpoint);
-        if (!res.ok || !res.body) {
-          throw new Error(`HTTP ${res.status}`);
+        const ctHeader = (res.headers.get('content-type') || '').toLowerCase();
+        const isImage = ctHeader.startsWith('image/');
+        if (!res.ok || !isImage || !res.body) {
+          // JSON 에러 바디 파싱 시도
+          let errMsg = `HTTP ${res.status}`;
+          try {
+            const data = await res.clone().json();
+            if (data && typeof data.message === 'string') errMsg = data.message;
+            if (data && typeof data.code === 'string') errMsg += ` (${data.code})`;
+          } catch {
+            try { errMsg = await res.text(); } catch {}
+          }
+          setMsg('캡처 실패: ' + errMsg, 'err');
+          setProgress(0);
+          // 실패 시 힌트 다시 보이기, 이미지 감추기
+          hint.hidden = false;
+          shot.hidden = true;
+          return;
         }
 
         const reader = res.body.getReader();

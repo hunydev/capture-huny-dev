@@ -87,6 +87,121 @@ const URL_KEY_PREFIX = "url|";
 const CRON_CURSOR_KEY = "cron|cursor:url";
 const CRON_BATCH_SIZE = 10; // 한 번의 cron 실행에서 처리할 최대 URL 수(순차 처리)
 
+// 타임아웃 및 UA 설정
+const DEFAULT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const PREFLIGHT_TIMEOUT_MS = 4000; // 프리플라이트 예비 점검 시간
+const GOTO_TIMEOUT_MS = 20000;     // 페이지 진입 타임아웃(dcl)
+const IDLE_TIMEOUT_MS = 3000;      // 네트워크 유휴 대기 최대시간
+const IDLE_IDLE_TIME_MS = 800;     // 유휴판정 시간
+const OVERALL_DEADLINE_MS = 25000; // 전체 캡처 마감시간
+
+function msLeft(deadlineAt) { return Math.max(0, deadlineAt - Date.now()); }
+
+async function fetchWithTimeout(resource, init = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  try {
+    return await fetch(resource, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+function jsonError(status, code, message, extraHeaders = {}, extraBody = {}) {
+  const h = new Headers({
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-capture-worker": "1",
+    "x-capture-fail": code || "error"
+  });
+  try {
+    for (const [k, v] of Object.entries(extraHeaders || {})) {
+      if (v !== undefined && v !== null) h.set(k, String(v));
+    }
+  } catch {}
+  const body = JSON.stringify({ ok: false, code, message, ...(extraBody || {}) });
+  return new Response(body, { status: status || 500, headers: h });
+}
+
+async function preflightCheck(normalized, env, budgetMs) {
+  const headers = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "user-agent": DEFAULT_UA
+  };
+  try {
+    // 1) HEAD 우선 시도
+    const resHead = await fetchWithTimeout(normalized, {
+      method: "HEAD",
+      headers,
+      redirect: "follow",
+      cf: { cacheTtl: 0, cacheEverything: false }
+    }, budgetMs);
+    if (resHead && resHead.status > 0) {
+      if (resHead.status === 405 || resHead.status === 501) {
+        // 일부 서버는 HEAD 미지원 → GET 폴백
+      } else if (resHead.status >= 200 && resHead.status < 400) {
+        return { ok: true };
+      } else if (resHead.status === 401 || resHead.status === 403 || resHead.status === 451) {
+        return { ok: false, status: 403, code: "preflight-blocked", message: `Blocked (${resHead.status})` };
+      } else if (resHead.status >= 500) {
+        return { ok: false, status: 504, code: "preflight-upstream", message: `Upstream error (${resHead.status})` };
+      }
+    }
+    // 2) GET 폴백 (짧은 시간)
+    const resGet = await fetchWithTimeout(normalized, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      cf: { cacheTtl: 0, cacheEverything: false }
+    }, Math.max(1000, Math.min(2500, budgetMs)));
+    if (resGet.status >= 200 && resGet.status < 400) return { ok: true };
+    if (resGet.status === 401 || resGet.status === 403 || resGet.status === 451) {
+      return { ok: false, status: 403, code: "preflight-blocked", message: `Blocked (${resGet.status})` };
+    }
+    if (resGet.status >= 500) return { ok: false, status: 504, code: "preflight-upstream", message: `Upstream error (${resGet.status})` };
+    // 기타 4xx는 빠른 실패 처리
+    return { ok: false, status: 403, code: "preflight-rejected", message: `Rejected (${resGet.status})` };
+  } catch (e) {
+    return { ok: false, status: 504, code: "preflight-timeout", message: "Preflight timeout or network error" };
+  }
+}
+
+async function setupPageForCapture(page) {
+  await page.setUserAgent(DEFAULT_UA);
+  await page.setExtraHTTPHeaders({ "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" });
+  // 트래커/애널리틱스 일부 차단으로 안정화
+  const blocked = [
+    "googletagmanager.com",
+    "google-analytics.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "facebook.net",
+    "facebook.com",
+    "hotjar.com",
+    "hotjar.io",
+    "segment.io",
+    "amplitude.com",
+    "mixpanel.com",
+    "clarity.ms",
+    "yandex.ru",
+    "yandex.com",
+    "cloudflareinsights.com"
+  ];
+  try {
+    await page.setRequestInterception(true);
+    page.on("request", req => {
+      const url = req.url();
+      const type = req.resourceType();
+      // ping/beacon류와 일부 트래커 스크립트/요청 차단
+      if (type === "ping" || type === "beacon") return req.abort();
+      if (blocked.some(d => url.includes(d))) return req.abort();
+      return req.continue();
+    });
+  } catch {}
+}
+
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
@@ -99,14 +214,11 @@ export default {
     // /screenshot 경로 또는 쿼리에 url이 있으면 캡처 API 시도
     if (pathname.startsWith("/screenshot") || pathname.startsWith("/api/screenshot") || hasTarget) {
       if (!hasTarget) {
-        return new Response("Missing 'url' query.", { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } });
+        return jsonError(400, "bad-request", "Missing 'url' query.", { "x-capture-cache": "miss" });
       }
       const normalized = normalizeTarget(target);
       if (!normalized) {
-        return new Response("Only huny.dev domain is allowed.", {
-          status: 403,
-          headers: { "content-type": "text/plain; charset=utf-8" }
-        });
+        return jsonError(403, "domain-not-allowed", "Only huny.dev domain is allowed.", { "x-capture-cache": "miss" });
       }
 
       // 1) KV 캐시 조회: 우선 순위 (풀 URL 키) → (레거시 호스트 키)
@@ -205,56 +317,81 @@ export default {
         }
       }
 
-      const browser = await puppeteer.launch(env.MYBROWSER);
-      try {
-        const page = await browser.newPage();
-        await page.setViewport({ width: 1200, height: 630, deviceScaleFactor: 2 });
-        await page.goto(normalized, { waitUntil: "networkidle0", timeout: 20000 });
-
-        const buf = await page.screenshot({ type: "png" });
-
-        // 2) 업로드 → Images → KV 저장 (베스트-effort, 실패해도 응답은 진행)
-        ctx?.waitUntil((async () => {
-          try {
-            if (!env.IMAGES_ACCOUNT_ID || !env.API_TOKEN) return;
-            const fd = new FormData();
-            fd.append("file", new Blob([buf], { type: "image/png" }), "screenshot.png");
-            // 공개 변형 접근을 보장 (Signed URL 불필요)
-            fd.append("requireSignedURLs", "false");
-            const api = `https://api.cloudflare.com/client/v4/accounts/${env.IMAGES_ACCOUNT_ID}/images/v1`;
-            const upRes = await fetch(api, {
-              method: "POST",
-              headers: { Authorization: `Bearer ${env.API_TOKEN}` },
-              body: fd
-            });
-            const upJson = await upRes.json();
-            if (upRes.ok && upJson?.success && upJson?.result) {
-              const imageId = upJson.result.id;
-              if (env.CAPTURE_KV && imageId) {
-                const body = JSON.stringify({ id: imageId });
-                const puts = [];
-                const urlKey2 = urlKeyFromNormalized(normalized);
-                const hostKey2 = keyFromNormalized(normalized);
-                if (urlKey2) puts.push(env.CAPTURE_KV.put(urlKey2, body));
-                if (hostKey2) puts.push(env.CAPTURE_KV.put(hostKey2, body));
-                await Promise.allSettled(puts);
-              }
-            }
-          } catch (e) {
-            // 업로드 실패는 무시 (로그만 가능하면 좋지만 워커 콘솔에 의존)
-          }
-        })());
-
-        return new Response(buf, {
-          headers: {
-            "content-type": "image/png",
-            "cache-control": "no-store, no-cache, must-revalidate",
-            "x-capture-worker": "1",
-            "x-capture-cache": force ? "refresh" : "miss"
-          }
+      // 프리플라이트로 방화벽/차단/연결 불가를 빠르게 식별
+      const deadlineAt = Date.now() + OVERALL_DEADLINE_MS;
+      const pf = await preflightCheck(normalized, env, Math.min(PREFLIGHT_TIMEOUT_MS, msLeft(deadlineAt)));
+      if (!pf.ok) {
+        return jsonError(pf.status || 504, pf.code || "preflight", pf.message || "Preflight failed", {
+          "x-capture-cache": force ? "refresh-preflight" : "miss-preflight"
         });
-      } finally {
-        await browser.close();
+      }
+
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.MYBROWSER);
+        try {
+          const page = await browser.newPage();
+          await setupPageForCapture(page);
+          await page.setViewport({ width: 1200, height: 630, deviceScaleFactor: 2 });
+          const gotoTimeout = Math.max(1000, Math.min(GOTO_TIMEOUT_MS, msLeft(deadlineAt)));
+          try {
+            await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: gotoTimeout });
+          } catch {}
+          const settleWait = Math.min(IDLE_IDLE_TIME_MS, Math.max(0, Math.min(IDLE_TIMEOUT_MS, msLeft(deadlineAt))));
+          if (settleWait > 0) await page.waitForTimeout(settleWait);
+
+          const buf = await page.screenshot({ type: "png" });
+
+          // 2) 업로드 → Images → KV 저장 (베스트-effort, 실패해도 응답은 진행)
+          ctx?.waitUntil((async () => {
+            try {
+              if (!env.IMAGES_ACCOUNT_ID || !env.API_TOKEN) return;
+              const fd = new FormData();
+              fd.append("file", new Blob([buf], { type: "image/png" }), "screenshot.png");
+              // 공개 변형 접근을 보장 (Signed URL 불필요)
+              fd.append("requireSignedURLs", "false");
+              const api = `https://api.cloudflare.com/client/v4/accounts/${env.IMAGES_ACCOUNT_ID}/images/v1`;
+              const upRes = await fetch(api, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${env.API_TOKEN}` },
+                body: fd
+              });
+              const upJson = await upRes.json();
+              if (upRes.ok && upJson?.success && upJson?.result) {
+                const imageId = upJson.result.id;
+                if (env.CAPTURE_KV && imageId) {
+                  const body = JSON.stringify({ id: imageId });
+                  const puts = [];
+                  const urlKey2 = urlKeyFromNormalized(normalized);
+                  const hostKey2 = keyFromNormalized(normalized);
+                  if (urlKey2) puts.push(env.CAPTURE_KV.put(urlKey2, body));
+                  if (hostKey2) puts.push(env.CAPTURE_KV.put(hostKey2, body));
+                  await Promise.allSettled(puts);
+                }
+              }
+            } catch (e) {
+              // 업로드 실패는 무시 (로그만 가능하면 좋지만 워커 콘솔에 의존)
+            }
+          })());
+
+          return new Response(buf, {
+            headers: {
+              "content-type": "image/png",
+              "cache-control": "no-store, no-cache, must-revalidate",
+              "x-capture-worker": "1",
+              "x-capture-cache": force ? "refresh" : "miss"
+            }
+          });
+        } finally {
+          await browser.close();
+        }
+      } catch (e) {
+        const name = (e && (e.name || e.code || e.type)) ? String(e.name || e.code || e.type) : "";
+        const msg = e && e.message ? String(e.message) : "Capture failed";
+        const isTimeout = /timeout/i.test(name + " " + msg);
+        return jsonError(isTimeout ? 504 : 500, isTimeout ? "capture-timeout" : "capture-failed", msg, {
+          "x-capture-cache": force ? "refresh-fail" : "miss-fail"
+        });
       }
     }
 
@@ -283,9 +420,20 @@ export default {
             const normalized = name.slice(URL_KEY_PREFIX.length);
             if (!isAllowedUrl(normalized)) continue; // 안전 도메인만 처리
             try {
+              // 프리플라이트로 빠른 차단
+              const sDeadlineAt = Date.now() + OVERALL_DEADLINE_MS;
+              const pf2 = await preflightCheck(normalized, env, Math.min(PREFLIGHT_TIMEOUT_MS, msLeft(sDeadlineAt)));
+              if (!pf2.ok) continue;
+
               const page = await browser.newPage();
+              await setupPageForCapture(page);
               await page.setViewport({ width: 1200, height: 630, deviceScaleFactor: 2 });
-              await page.goto(normalized, { waitUntil: "networkidle0", timeout: 20000 });
+              const gotoTimeout2 = Math.max(1000, Math.min(GOTO_TIMEOUT_MS, msLeft(sDeadlineAt)));
+              try {
+                await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: gotoTimeout2 });
+              } catch {}
+              const settleWait2 = Math.min(IDLE_IDLE_TIME_MS, Math.max(0, Math.min(IDLE_TIMEOUT_MS, msLeft(sDeadlineAt))));
+              if (settleWait2 > 0) await page.waitForTimeout(settleWait2);
               const buf = await page.screenshot({ type: "png" });
               await page.close();
 
