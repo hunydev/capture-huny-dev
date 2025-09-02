@@ -97,6 +97,7 @@ const IDLE_IDLE_TIME_MS = 800;     // 유휴판정 시간
 const OVERALL_DEADLINE_MS = 25000; // 전체 캡처 마감시간
 
 function msLeft(deadlineAt) { return Math.max(0, deadlineAt - Date.now()); }
+function sleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
 
 async function fetchWithTimeout(resource, init = {}, timeoutMs = 5000) {
   const controller = new AbortController();
@@ -338,7 +339,7 @@ export default {
             await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: gotoTimeout });
           } catch {}
           const settleWait = Math.min(IDLE_IDLE_TIME_MS, Math.max(0, Math.min(IDLE_TIMEOUT_MS, msLeft(deadlineAt))));
-          if (settleWait > 0) await page.waitForTimeout(settleWait);
+          if (settleWait > 0) await sleep(settleWait);
 
           const buf = await page.screenshot({ type: "png" });
 
@@ -388,7 +389,7 @@ export default {
       } catch (e) {
         const name = (e && (e.name || e.code || e.type)) ? String(e.name || e.code || e.type) : "";
         const msg = e && e.message ? String(e.message) : "Capture failed";
-        const isTimeout = /timeout/i.test(name + " " + msg);
+        const isTimeout = name === "TimeoutError" || /\btimeout\b|\btimed out\b/i.test(msg);
         return jsonError(isTimeout ? 504 : 500, isTimeout ? "capture-timeout" : "capture-failed", msg, {
           "x-capture-cache": force ? "refresh-fail" : "miss-fail"
         });
@@ -433,7 +434,7 @@ export default {
                 await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: gotoTimeout2 });
               } catch {}
               const settleWait2 = Math.min(IDLE_IDLE_TIME_MS, Math.max(0, Math.min(IDLE_TIMEOUT_MS, msLeft(sDeadlineAt))));
-              if (settleWait2 > 0) await page.waitForTimeout(settleWait2);
+              if (settleWait2 > 0) await sleep(settleWait2);
               const buf = await page.screenshot({ type: "png" });
               await page.close();
 
