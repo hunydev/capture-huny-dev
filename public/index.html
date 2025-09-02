@@ -119,7 +119,7 @@
         <div id="hint" class="hint">
           <div>
             <div style="font-size:16px; margin-bottom:6px;">썸네일 프레임</div>
-            <div>아래에 <code>http(s)://…</code> URL을 넣고 <b>캡처</b>를 눌러보세요.<br/>페이지에 소셜 메타(OG/Twitter 등)가 있으면 그대로 반환, 없으면 <code>huny.dev</code> 도메인만 렌더링 캡처합니다.</div>
+            <div>아래에 <code>http(s)://…</code> URL을 넣고 <b>캡처</b>를 눌러보세요.<br/><code>huny.dev</code> 도메인은 <b>항상 렌더링 캡처</b>하고, 그 외 도메인은 페이지의 소셜 메타(OG/Twitter 등)만 사용합니다(없으면 404).</div>
           </div>
         </div>
       </div>
@@ -131,7 +131,7 @@
       </div>
 
       <div class="row">
-        <div class="chip">정책: 소셜 메타 이미지 우선 반환, 없으면 huny.dev만 렌더링</div>
+        <div class="chip">정책: huny.dev는 항상 렌더링, 그 외는 소셜 메타만 반환</div>
         <div class="chip">기본 사이즈(렌더링): 1200×630</div>
         <div class="chip">응답: 이미지(소셜 메타 원본 또는 PNG)</div>
       </div>

@@ -379,8 +379,6 @@ export default {
     const hasTarget = typeof target === "string" && target.trim().length > 0;
     const forceParam = url.searchParams.get("force");
     const force = typeof forceParam === "string" && /^(1|true|yes)$/i.test(forceParam);
-    const previewParam = url.searchParams.get("preview");
-    const preview = typeof previewParam === "string" && /^(1|true|yes)$/i.test(previewParam);
 
     // /screenshot 경로 또는 쿼리에 url이 있으면 캡처 API 시도
     if (pathname.startsWith("/screenshot") || pathname.startsWith("/api/screenshot") || hasTarget) {
@@ -394,69 +392,14 @@ export default {
 
       // 전체 예산 시작
       const deadlineAt = Date.now() + OVERALL_DEADLINE_MS;
-
-      // preview 모드: huny.dev 전용 강제 렌더링 (메타/캐시 우회, 업로드/캐시 저장 안 함)
-      if (preview) {
-        const isHunyPrev = isCaptureAllowedUrl(normalized);
-        if (!isHunyPrev) {
-          return jsonError(403, "preview-not-allowed", "Preview rendering is allowed only for huny.dev.", {
-            "x-capture-cache": "preview-deny"
-          });
-        }
-
-        const pfPrev = await preflightCheck(normalized, env, Math.min(PREFLIGHT_TIMEOUT_MS, msLeft(deadlineAt)));
-        if (!pfPrev.ok) {
-          return jsonError(pfPrev.status || 504, pfPrev.code || "preflight", pfPrev.message || "Preflight failed", {
-            "x-capture-cache": "preview-preflight"
-          });
-        }
-
-        let browser;
-        try {
-          browser = await puppeteer.launch(env.MYBROWSER);
-          try {
-            const page = await browser.newPage();
-            await setupPageForCapture(page);
-            await page.setViewport({ width: 1200, height: 630, deviceScaleFactor: 2 });
-            const gotoTimeout = Math.max(1000, Math.min(GOTO_TIMEOUT_MS, msLeft(deadlineAt)));
-            try {
-              await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: gotoTimeout });
-            } catch {}
-            const settleWait = Math.min(IDLE_IDLE_TIME_MS, Math.max(0, Math.min(IDLE_TIMEOUT_MS, msLeft(deadlineAt))));
-            if (settleWait > 0) await sleep(settleWait);
-            const buf = await page.screenshot({ type: "png" });
-            return new Response(buf, {
-              headers: {
-                "content-type": "image/png",
-                "cache-control": "no-store, no-cache, must-revalidate",
-                "x-capture-worker": "1",
-                "x-capture-source": "preview",
-                "x-capture-cache": "preview",
-                "x-preview": "1"
-              }
-            });
-          } finally {
-            await browser.close();
-          }
-        } catch (e) {
-          const name = (e && (e.name || e.code || e.type)) ? String(e.name || e.code || e.type) : "";
-          const msg = e && e.message ? String(e.message) : "Preview capture failed";
-          const isTimeout = name === "TimeoutError" || /\btimeout\b|\btimed out\b/i.test(msg);
-          return jsonError(isTimeout ? 504 : 500, isTimeout ? "preview-timeout" : "preview-failed", msg, {
-            "x-capture-cache": "preview-fail"
-          });
-        }
-      }
-
-      // 0) 소셜 메타(OG/Twitter/link) 이미지 우선 시도 (도메인 무관, 성공 시 바로 반환)
-      try {
-        const socialRes = await tryFetchSocialImageResponse(normalized, env, deadlineAt);
-        if (socialRes) return socialRes;
-      } catch {}
-
-      // 0-1) huny.dev가 아니고 소셜 메타 이미지도 없으면 에러 반환
+      // 도메인 분기: huny.dev는 항상 캡처(캐시 우선), 그 외는 소셜 메타(OG/Twitter/link)만 허용
       const isHuny = isCaptureAllowedUrl(normalized);
       if (!isHuny) {
+        // 비-huny.dev: 소셜 메타만 시도
+        try {
+          const socialRes = await tryFetchSocialImageResponse(normalized, env, deadlineAt);
+          if (socialRes) return socialRes;
+        } catch {}
         return jsonError(404, "social-not-found", "No social meta image (OG/Twitter/link) found; rendering capture is allowed only for huny.dev.", {
           "x-capture-cache": "meta-miss"
         });
@@ -619,7 +562,8 @@ export default {
               "content-type": "image/png",
               "cache-control": "no-store, no-cache, must-revalidate",
               "x-capture-worker": "1",
-              "x-capture-cache": force ? "refresh" : "miss"
+              "x-capture-cache": force ? "refresh" : "miss",
+              "x-capture-source": "capture"
             }
           });
         } finally {
