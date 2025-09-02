@@ -65,6 +65,23 @@ function extractImageIdFromVariantUrl(u) {
   }
 }
 
+// KV 저장 문자열에서 이미지 ID를 추출 (신규 {id} 또는 레거시 {url} 모두 지원)
+function getIdFromKVStringValue(cached) {
+  if (!cached) return null;
+  try {
+    const rec = JSON.parse(cached);
+    if (rec?.id && typeof rec.id === "string") return rec.id;
+    if (rec?.url) {
+      const parsed = extractImageIdFromVariantUrl(rec.url);
+      if (parsed) return parsed;
+    }
+  } catch {
+    const parsed = extractImageIdFromVariantUrl(cached);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
 // KV 키 프리픽스: 풀 URL 저장 키
 const URL_KEY_PREFIX = "url|";
 const CRON_CURSOR_KEY = "cron|cursor:url";
@@ -274,6 +291,22 @@ export default {
 
               // 업로드 후 ID 저장
               if (env.IMAGES_ACCOUNT_ID && env.API_TOKEN) {
+                // 1) 기존 이미지 ID 조회 (url 키 우선, 없으면 host 키)
+                const urlKey2 = urlKeyFromNormalized(normalized);
+                const hostKey2 = keyFromNormalized(normalized);
+                let prevId = null;
+                try {
+                  if (urlKey2) {
+                    const prevVal = await env.CAPTURE_KV.get(urlKey2, { type: "text" });
+                    prevId = getIdFromKVStringValue(prevVal);
+                  }
+                  if (!prevId && hostKey2) {
+                    const prevVal2 = await env.CAPTURE_KV.get(hostKey2, { type: "text" });
+                    prevId = getIdFromKVStringValue(prevVal2);
+                  }
+                } catch {}
+
+                // 2) 신규 업로드
                 const fd = new FormData();
                 fd.append("file", new Blob([buf], { type: "image/png" }), "screenshot.png");
                 fd.append("requireSignedURLs", "false");
@@ -284,11 +317,17 @@ export default {
                   const imageId = upJson.result.id;
                   const body = JSON.stringify({ id: imageId });
                   const puts = [];
-                  const urlKey2 = urlKeyFromNormalized(normalized);
-                  const hostKey2 = keyFromNormalized(normalized);
                   if (urlKey2) puts.push(env.CAPTURE_KV.put(urlKey2, body));
                   if (hostKey2) puts.push(env.CAPTURE_KV.put(hostKey2, body));
                   await Promise.allSettled(puts);
+
+                  // 3) 이전 이미지 삭제 (성공적으로 신규 저장된 뒤)
+                  if (prevId && prevId !== imageId) {
+                    try {
+                      const delUrl = `https://api.cloudflare.com/client/v4/accounts/${env.IMAGES_ACCOUNT_ID}/images/v1/${encodeURIComponent(prevId)}`;
+                      await fetch(delUrl, { method: "DELETE", headers: { Authorization: `Bearer ${env.API_TOKEN}` } });
+                    } catch {}
+                  }
                 }
               }
             } catch {
